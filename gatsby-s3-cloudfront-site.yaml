@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  DomainName: 
+    Type: String
+    Description: The Domain Name for this site
+    Default: gatsby-s3-cloudfront-site.co
+  ErrorPagePath:
+    Type: String
+    Default: /404.html
+  PriceClass:
+    Type: String
+    Description: The CloudFront distribution price class
+    Default: PriceClass_All
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket:
+        Ref: S3Bucket
+      PolicyDocument:
+        Statement:
+          - Action: 's3:GetObject'
+            Effect: Allow
+            Resource: !Sub '${S3Bucket.Arn}/*'
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+    DeletionPolicy: Delete
+  CloudFrontOriginAccessIdentity:
+    Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'CloudFront OAI for ${DomainName}'
+    DeletionPolicy: Delete
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - DomainName: !GetAtt S3Bucket.DomainName
+            Id: !Ref S3Bucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}'
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          CachedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          TargetOriginId: !Ref S3Bucket
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Headers:
+              - Origin
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: allow-all
+          LambdaFunctionAssociations:
+            - EventType: 'origin-request'
+              LambdaFunctionARN: !Ref VersionedOriginRequestFunction
+            - EventType: 'origin-response'
+              LambdaFunctionARN: !Ref VersionedOriginResponseFunction
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: !Ref ErrorPagePath
+        HttpVersion: http2
+        PriceClass: !Ref PriceClass
+    DependsOn:
+      - CloudFrontOriginAccessIdentity
+    DeletionPolicy: Delete
+
+## Lambda @ Edge setup for Cloudfront
+
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+                - 'edgelambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+# This function redirects folder requests to the index.html page.
+# Without this we wouldn't be able to link directly to subpages
+  OriginRequestFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          'use strict';
+          exports.handler = (event, context, callback) => {
+            const request = event.Records[0].cf.request;
+            const uri = request.uri;
+            if (uri.endsWith('/')) {
+              request.uri += 'index.html';
+            } else if (!uri.includes('.')) {
+              request.uri += '/index.html';
+            }
+            callback(null, request);
+          };
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'nodejs12.x'
+      Timeout: 5
+  VersionedOriginRequestFunction:
+    Type: 'AWS::Lambda::Version'
+    Properties:
+      FunctionName: !Ref OriginRequestFunction
+  # This function adds cache-control headers
+  # Based on gatsby caching guidelines: https://github.com/gatsbyjs/gatsby/blob/master/docs/docs/caching.md
+  OriginResponseFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          'use strict';
+          exports.handler = (event, context, callback) => {
+            const request = event.Records[0].cf.request;
+            const response = event.Records[0].cf.response;
+            const headers = response.headers;
+            if ((request.uri.startsWith('/static/'))) {
+              headers['cache-control'] = [
+                {
+                  key: 'Cache-Control',
+                  value: 'public, max-age=31536000, immutable'
+                }
+              ];
+            } else {
+              headers['cache-control'] = [
+                {
+                  key: 'Cache-Control',
+                  value: 'public, max-age=0, must-revalidate'
+                }
+              ];
+            }
+            callback(null, response);
+          };
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'nodejs12.x'
+      Timeout: 5 
+  VersionedOriginResponseFunction:
+    Type: 'AWS::Lambda::Version'
+    Properties:
+      FunctionName: !Ref OriginResponseFunction
+Outputs:
+  BucketName:
+    Description: 'S3 Bucket Name'
+    Value: !Ref S3Bucket
+  DistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+  Domain:
+    Description: 'Cloudfront Domain'
+    Value: !GetAtt CloudFrontDistribution.DomainName
